@@ -18,6 +18,8 @@ allowed-tools:
   - Read
   - Grep
   - Glob
+  - TaskCreate
+  - TaskUpdate
 ---
 
 # Atomic -- Git Workflow for Atomic Changes
