@@ -40,7 +40,11 @@ Pass `--dry-run` to any subcommand to preview without executing. In dry-run
 mode, run only read-only inspection (e.g. `status`, `diff`, `log`, `show`) and
 present the plan or assessment, then **stop before any command that mutates the
 repo, index, or commits** (`git add`, `commit`, `rebase`, `cherry-pick`,
-`checkout`, `--fixup`). `generate` never commits, so `--dry-run` is a no-op there.
+`checkout`, `--fixup`). `generate` never commits, so `--dry-run` only suppresses
+the clipboard write (otherwise a no-op).
+
+Commit-message notation used throughout: `<type>[(scope)]: <description>` — the
+`[(scope)]` means an optional `(scope)`, e.g. `feat(auth): …` or `feat: …`.
 
 ---
 
@@ -64,7 +68,9 @@ git log --oneline -5               # recent commits for style context
 **Untracked files**: `git diff` does not show untracked files. Check
 `git status --short` for `??` entries. For each untracked file, read its
 contents to classify it into a group. Stage untracked files with
-`git add <file>` (they are always whole-file, no hunk splitting needed).
+`git add <file>` (whole-file by default). A brand-new file can still mix
+concerns — if it genuinely does, `git add -N <file>` then hunk-stage it like
+any tracked file.
 
 Read diffs **per group** as you analyze (not all upfront). For large changesets
 (20+ files), reading everything into context at once will degrade quality.
@@ -110,13 +116,16 @@ decision table at the top of [Hunk-Level Staging](#hunk-level-staging) — the
 Default ordering by risk (lowest risk to codebase first):
 
 1. `ci` -- CI/CD pipeline changes (no runtime impact)
-2. `docs` -- documentation only
-3. `test` -- test additions/changes
-4. `chore` -- maintenance, config, dependencies
-5. `fix` -- bug fixes
-6. `refactor` -- code restructuring
-7. `feat` -- new features
-8. `perf` -- performance improvements (touches hot paths)
+2. `build` -- build system / tooling changes (no runtime impact)
+3. `docs` -- documentation only
+4. `test` -- test additions/changes
+5. `chore` -- maintenance, config, dependencies
+6. `fix` -- bug fixes
+7. `refactor` -- code restructuring
+8. `feat` -- new features
+9. `perf` -- performance improvements (touches hot paths)
+
+`revert` has no fixed slot — order it by the risk of the change it undoes.
 
 Override this ordering when dependency requires it (e.g., a schema migration
 must come before the code that uses it).
@@ -142,6 +151,10 @@ Atomic commit plan (N commits):
 **Wait for user approval before executing.** The user may reorder, merge,
 split, or rename groups.
 
+If any group has to stage a whole file whose hunks didn't cleanly separate (the
+"dominant group" fallback), name that non-atomic residue explicitly in the plan
+so the user approves it knowingly.
+
 #### 6. Execute
 
 If the plan from step 5 includes any file in **3+ commit groups**, run
@@ -154,7 +167,7 @@ For each commit group, sequentially:
 
 1. **Stage files**: `git add <file1> <file2> ...` for whole-file changes
 2. **Stage hunks**: Use hunk-level staging for partial-file changes
-3. **Commit**: `git commit -m "<type>[scope]: <description>"`
+3. **Commit**: `git commit -m "<type>[(scope)]: <description>"`
 4. **Verify**: `git status --short` to confirm expected state
 
 Each commit consumes the staged changes, so subsequent groups stage from the
@@ -169,7 +182,7 @@ verifying after a commit (step 4). Read full diffs once per file, not per group.
 After all commits:
 
 ```bash
-git log --oneline -N    # show the N new commits
+git log --oneline -<count>    # the new commits (substitute the count, e.g. -3)
 ```
 
 Surface any remaining unstaged/untracked changes.
@@ -194,7 +207,10 @@ PATCH=$(mktemp)
 git diff -- <file> > "$PATCH"
 
 # Edit the patch to include only the desired hunks:
-# - Keep the diff header (first 4 lines: diff, index, ---, +++)
+# - Keep the complete file header through the ---/+++ lines, INCLUDING any
+#   extended header lines (new file mode, deleted file mode, rename from/to,
+#   etc.) — not just the first 4. Binary and mode-only changes can't be
+#   hunk-split; stage them whole-file instead.
 # - Keep only the @@ hunk headers and content for target hunks
 # - Remove unwanted hunks entirely
 
@@ -240,8 +256,10 @@ intermediate commit shifts context lines, and you'd need to recompute
 hunk headers after each one. The reliable workflow:
 
 ```bash
-# Pre-flight: save full diffs of every multi-commit file, then reset
-# them to HEAD so the working tree is clean.
+# Pre-flight: save full diffs of every multi-commit file, then reset them to
+# HEAD so the working tree is clean. This captures staged AND unstaged hunks
+# together and resets the file, intentionally discarding any prior index
+# boundary for these files — you're re-splitting them across 3+ groups anyway.
 PATCH_DIR=$(mktemp -d -t atomic-patches.XXXXXX)
 MULTI_COMMIT_FILES=(path/to/file-a path/to/file-b)
 for f in "${MULTI_COMMIT_FILES[@]}"; do
@@ -250,22 +268,35 @@ for f in "${MULTI_COMMIT_FILES[@]}"; do
   git diff --binary HEAD -- "$f" > "$PATCH_DIR/${f//\//__}.patch"
 done
 git checkout HEAD -- "${MULTI_COMMIT_FILES[@]}"
+```
 
-# For each commit group that touches one of these files:
-# 1. Apply just the changes needed for THIS commit, via the Edit tool
-#    (or sed/awk for mechanical edits like a global rename).
-# 2. Stage the file: git add <file>
-# 3. Commit the group.
-# 4. After ALL groups have committed, sanity-check that the per-commit
-#    Edits add up to the original working-tree state:
-#       git apply --3way "$PATCH_DIR/${f//\//__}.patch"
-#       git diff --exit-code -- "$f"    # no diff means patch was absorbed
-#    A clean path-scoped diff means HEAD matches the original working-tree
-#    state for that file. If the diff shows changes or `--3way` produces
-#    conflict markers, the Edits drifted from intent. Reset with
-#    `git checkout HEAD -- <file>` and investigate before pushing.
+Then, for each commit group that touches one of these files:
 
-# Cleanup
+1. Apply just the changes needed for THIS commit with the **Edit tool**.
+2. Stage the file: `git add <file>`.
+3. Commit the group.
+
+After **all** groups have committed, run the sanity-check and cleanup as a
+**separate** step — keep them out of the pre-flight block above, since running
+`rm -rf` there would delete the patches before this check ever runs:
+
+```bash
+# Confirm the per-commit Edits add up to the original working-tree state.
+# set -e so a failed apply or a mismatch aborts BEFORE the cleanup below.
+set -e
+for f in "${MULTI_COMMIT_FILES[@]}"; do
+  # --3way implies --index (it updates index AND working tree). Diff against
+  # HEAD, not the index — after the apply, working tree == index, so a plain
+  # `git diff` would always be clean and the check would be defeated.
+  git apply --3way "$PATCH_DIR/${f//\//__}.patch"
+  git diff --exit-code HEAD -- "$f"    # clean == HEAD already holds the change
+done
+# A clean diff against HEAD means HEAD matches the original working-tree state
+# for that file. If the diff shows changes or `--3way` produces conflict
+# markers, the Edits drifted from intent. Reset with
+# `git checkout HEAD -- <file>` and investigate before pushing.
+
+# Cleanup — only reached if set -e didn't abort, i.e. every check above passed.
 rm -rf "$PATCH_DIR"
 ```
 
@@ -297,8 +328,10 @@ Generate a conventional commit message for currently staged changes.
 3. **Atomicity check**: Before generating, check if staged changes span
    multiple concerns (unrelated directories/modules, mixed types like fix +
    feat). If so, warn that this isn't atomic and suggest `/atomic commit`
-4. Print the message; copy it to the clipboard if a tool is available
-   (`pbcopy` on macOS, `wl-copy` or `xclip` on Linux), otherwise skip silently
+4. Print the message; best-effort copy to the clipboard if a tool is available
+   (`pbcopy` on macOS, `wl-copy` or `xclip` on Linux) — the piped write may need
+   a one-time permission prompt; skip silently if unavailable or declined.
+   Under `--dry-run`, skip the clipboard write so the run is side-effect-free
 5. Do NOT commit -- the user will use a separate command for that
 
 Message format:
@@ -404,11 +437,19 @@ Plan and guide interactive rebase of the current branch from a base commit.
    When any `fixup!` commits are present among the commits to replay, recommend
    `--autosquash` instead of a hand-written plan.
 4. **Present plan** with rationale for each action
-5. **Execute**: Bypass the interactive editor by writing the rebase-todo
-   to a file and injecting it via `GIT_SEQUENCE_EDITOR`. Create the plan
-   file with the **Write tool** (not a shell heredoc) at
-   `.git/rebase-todo-plan` — it lives under `.git/`, so it is never
-   committed and is overwritten on reuse:
+5. **Execute**: Bypass the interactive editor by writing the rebase-todo to a
+   file and injecting it via `GIT_SEQUENCE_EDITOR`. First resolve the absolute
+   git-dir path — correct even in worktrees/submodules (where `.git` is a file)
+   or when run from a subdirectory (a relative `.git/...` path breaks because git
+   runs the sequence editor from the repo root, not your CWD):
+
+   ```bash
+   git rev-parse --absolute-git-dir    # e.g. /path/to/repo/.git
+   ```
+
+   Create `<git-dir>/rebase-todo-plan` with the **Write tool** (not a shell
+   heredoc). It lives under the git dir, so it is never committed and is
+   overwritten on reuse:
 
    ```
    pick abc1234 feat: add search
@@ -419,19 +460,29 @@ Plan and guide interactive rebase of the current branch from a base commit.
    Then run the rebase, injecting that file as the sequence editor:
 
    ```bash
-   # The trailing `#` comments out the filename arg git appends to the editor command.
-   GIT_SEQUENCE_EDITOR='cp .git/rebase-todo-plan "$1"; #' git rebase -i <base>
+   export PLAN="$(git rev-parse --absolute-git-dir)/rebase-todo-plan"
+   # git launches the editor via `sh -c` and appends the todo-file path, so
+   # `cp "$PLAN"` becomes `cp "$PLAN" <todo-file>`. PLAN is exported and
+   # double-quoted, so it expands from the environment (safe for spaces and shell
+   # metacharacters) and is never re-parsed as code. Keep positional parameters
+   # ($1, $2, …) out of the editor command — argument / slash-command
+   # substitution can rewrite those placeholders before the shell sees them;
+   # referencing the exported $PLAN sidesteps that class of bug entirely.
+   GIT_SEQUENCE_EDITOR='cp "$PLAN"' git rebase -i <base>
    rebase_status=$?
-   rm -f .git/rebase-todo-plan
+   rm -f "$PLAN"
    exit "$rebase_status"
    ```
    - For simple autosquash: `GIT_SEQUENCE_EDITOR=: git rebase -i --autosquash <base>`
    - For splitting: mark the commit as `edit` in the plan. When rebase pauses,
      run `git reset HEAD~1` then use `/atomic commit` to re-commit atomically
-   - If the plan includes `reword`, set `GIT_EDITOR` (the commit-message
-     editor) for that step, or let rebase pause and run
-     `git commit --amend -m "new message"` followed by `git rebase --continue`.
-     `GIT_SEQUENCE_EDITOR` only handles the rebase-todo file, not commit messages
+   - If the plan includes `reword` **or `squash`**, the commit-message editor
+     opens after the todo step (in the non-interactive Bash tool an unmanaged
+     editor hangs/fails) — set `GIT_EDITOR` for that step, or let rebase pause
+     and run `git commit --amend -m "new message"` followed by
+     `git rebase --continue`. `GIT_SEQUENCE_EDITOR` only handles the rebase-todo
+     file, not commit messages. Prefer `fixup` over `squash` when the squashed
+     commit's message can be discarded — `fixup` opens no editor
 
 ### Safety
 
@@ -452,16 +503,22 @@ Analyze and safely cherry-pick commits or ranges.
 
 ```
 /atomic cherry-pick <ref>                    # single commit
-/atomic cherry-pick <start>..<end>           # range (inclusive)
+/atomic cherry-pick <start>..<end>           # inclusive: both <start> and <end> are picked
 ```
 
 ### Workflow
+
+**Pre-flight (clean tree)**: Run `git status --short`. If the working tree or
+index is dirty, surface it and require a clean state or explicit user approval
+before cherry-picking — a dirty tree muddies conflict resolution and the partial
+`git apply --index` path can entangle local edits. Never proceed silently.
 
 1. **Analyze target commits**:
    ```bash
    # Inclusive range: use <start>^..<end> so the start commit isn't dropped
    # (plain A..B excludes A). If <start> is the repo's root commit it has no
-   # parent — drop the ^ and use <start>..<end>. Single commit: git show --stat <ref>.
+   # parent — use <end> alone (e.g. git log <end>), which covers every commit
+   # up to and including <end>. Single commit: git show --stat <ref>.
    git log --stat <start>^..<end>    # summary + file stats in one call
    ```
    Only read full diffs (`git show <sha>`) for commits that need deeper
@@ -471,6 +528,11 @@ Analyze and safely cherry-pick commits or ranges.
    - Files modified that don't exist on the current branch
    - Functions/types referenced that aren't defined on current branch
    - Schema or migration dependencies
+   - **Merge commits in a range**: run `git rev-list --merges <start>^..<end>`
+     (drop the `^` if `<start>` is the repo's root commit, as above). A merge
+     can't be cherry-picked without an explicit mainline (`-m <parent>`), which
+     can't be chosen blindly — if any exist, ask whether to exclude them or pick
+     a specific merge with `-m`. Never auto-pick a mainline
 3. **Present assessment**:
    - Safe to cherry-pick (self-contained)
    - Needs adaptation (minor conflicts expected)
@@ -480,14 +542,15 @@ Analyze and safely cherry-pick commits or ranges.
    # Single commit
    git cherry-pick <sha>
 
-   # Range (preserving order)
+   # Range (preserving order). If <start> is the repo's root commit, drop the ^
+   # (it has no parent): git rev-list --reverse <end> | git cherry-pick --stdin
    git rev-list --reverse <start>^..<end> | git cherry-pick --stdin
 
    # If conflicts arise, help resolve them
    git cherry-pick --continue   # after resolution
    git cherry-pick --abort      # if user wants to bail
    ```
-5. **Verify**: `git log --oneline -N` and `git diff HEAD~N..HEAD --stat`
+5. **Verify**: `git log --oneline -<count>` and `git diff HEAD~<count>..HEAD --stat` (substitute the commit count)
 
 ### Partial Cherry-Pick
 
@@ -505,7 +568,8 @@ git commit -m "<type>: <description> (cherry-picked from <short-sha>)"
 
 See the safety warnings under Hunk-Level Staging for recovery if `git apply`
 fails. If partial extraction is too complex, cherry-pick the full commit and
-clean up unwanted changes afterward with a follow-up commit or amend.
+clean up unwanted changes afterward with a follow-up commit (not `--amend` —
+see Safety Rules).
 
 ---
 
@@ -533,7 +597,9 @@ Create fixup commits that target existing commits for later autosquash.
    ```
 6. Remind user to integrate later with one of:
    - `/atomic rebase` (agent-assisted)
-   - `git rebase -i --autosquash <target-sha>~1` (user runs directly)
+   - `git rebase -i --autosquash <target-sha>~1` (user runs directly). If the
+     target is the repo's root commit it has no `~1` — use
+     `git rebase -i --root --autosquash` instead
 
 ---
 
