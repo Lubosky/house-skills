@@ -264,6 +264,11 @@ hunk headers after each one. The reliable workflow:
 # boundary for these files — you're re-splitting them across 3+ groups anyway.
 PATCH_DIR=$(mktemp -d -t atomic-patches.XXXXXX)
 MULTI_COMMIT_FILES=(path/to/file-a path/to/file-b)
+The block below captures every multi-commit file's full diff to `$PATCH_DIR`
+*before* the `git checkout HEAD` discards those changes — run it as a whole, and
+never run the `git checkout` line in isolation. Keep `$PATCH_DIR` until the final
+sanity-check passes.
+
 for f in "${MULTI_COMMIT_FILES[@]}"; do
   # Diff against HEAD so staged AND unstaged hunks are captured; slug the path
   # so files that share a basename don't overwrite each other's patch.
@@ -496,6 +501,8 @@ Plan and guide interactive rebase of the current branch from a base commit.
 - Never rebase published commits without explicit user confirmation
 
 ---
+- Offer to create a restore point (a backup branch or checkpoint) before
+  rebasing -- it rewrites history and is awkward to unwind without one
 
 ## Subcommand: `cherry-pick`
 
@@ -513,7 +520,8 @@ Analyze and safely cherry-pick commits or ranges.
 **Pre-flight (clean tree)**: Run `git status --short`. If the working tree or
 index is dirty, surface it and require a clean state or explicit user approval
 before cherry-picking — a dirty tree muddies conflict resolution and the partial
-`git apply --index` path can entangle local edits. Never proceed silently.
+`git apply --index` path can entangle local edits. Never proceed silently. For a
+range pick, offer to create a restore point (backup branch or checkpoint) first.
 
 1. **Analyze target commits**:
    ```bash
@@ -646,9 +654,9 @@ semantic conflicts.
 - One logical change per commit
 - Each commit is independently reviewable
 - Dependency-aware ordering (schema before code, types before usage)
-- Conventional Commits format: `<type>[(scope)]: <description>`
-- Imperative mood, lowercase, no trailing period
-- Subject line under 72 characters
+- Conventional Commits format and message mechanics (imperative mood,
+  lowercase, no trailing period, subject under 72 chars) live in the
+  `generate` subcommand's Rules and Conventional Commit Types table
 - Commit messages and PR descriptions must not reference
   session-internal artifacts (audits, scratch notes, plans, review
   rounds, prior sessions). See **Commit and PR Message Hygiene** for
