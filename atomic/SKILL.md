@@ -3,10 +3,12 @@ name: atomic
 description: >-
   Split working tree changes into logical atomic commits, generate commit
   messages, plan interactive rebases, and cherry-pick safely. Subcommands:
-  commit (default), generate, rebase, cherry-pick, fixup.
+  commit (default), generate, rebase, cherry-pick, fixup, audit (alias
+  lint -- scan existing commit messages for session-internal references).
   All subcommands support --dry-run for preview without execution.
   TRIGGER when: user has uncommitted changes to organize, wants to split
-  a large diff into atomic commits, needs rebase/cherry-pick guidance, or
+  a large diff into atomic commits, needs rebase/cherry-pick guidance,
+  wants commit history checked for message-hygiene violations, or
   invokes /atomic.
   DO NOT TRIGGER when: user wants a single simple one-shot commit with no splitting.
 allowed-tools:
@@ -28,13 +30,14 @@ Split messy diffs into clean, logical, independently reviewable commits.
 
 ## Subcommands
 
-| Subcommand    | Purpose                                                  |
-|---------------|----------------------------------------------------------|
-| `commit`      | Default. Analyze changes, group into atomic commits, execute |
-| `generate`    | Generate a conventional commit message for currently staged files |
-| `rebase`      | Plan and execute interactive rebase from a base commit   |
-| `cherry-pick` | Analyze and safely cherry-pick commits or ranges         |
-| `fixup`       | Create fixup commits targeting existing commits          |
+| Subcommand    | Purpose                                                            |
+|---------------|--------------------------------------------------------------------|
+| `commit`      | Default. Analyze changes, group into atomic commits, execute       |
+| `generate`    | Generate a conventional commit message for currently staged files  |
+| `rebase`      | Plan and execute interactive rebase from a base commit             |
+| `cherry-pick` | Analyze and safely cherry-pick commits or ranges                   |
+| `fixup`       | Create fixup commits targeting existing commits                    |
+| `audit`       | Alias `lint`. Scan commit messages for session-internal references |
 
 Usage: `/atomic [subcommand] [args]`
 
@@ -43,7 +46,8 @@ mode, run only read-only inspection (e.g. `status`, `diff`, `log`, `show`) and
 present the plan or assessment, then **stop before any command that mutates the
 repo, index, or commits** (`git add`, `commit`, `rebase`, `cherry-pick`,
 `checkout`, `--fixup`). `generate` never commits, so `--dry-run` only suppresses
-the clipboard write (otherwise a no-op).
+the clipboard write (otherwise a no-op). `audit` is propose-only either way;
+its `--dry-run` means report only -- never offer the reword handoff.
 
 Commit-message notation used throughout: `<type>[(scope)]: <description>` — the
 `[(scope)]` means an optional `(scope)`, e.g. `feat(auth): …` or `feat: …`.
@@ -189,6 +193,9 @@ git log --oneline -<count>    # the new commits (substitute the count, e.g. -3)
 
 Surface any remaining unstaged/untracked changes.
 
+After committing, you can `/atomic audit` the range to catch
+process-reference leakage that slipped past draft-time review.
+
 ### Hunk-Level Staging
 
 Strategy when a file spans multiple commit groups:
@@ -257,6 +264,11 @@ When a single file appears in **three or more** commit groups, serial
 intermediate commit shifts context lines, and you'd need to recompute
 hunk headers after each one. The reliable workflow:
 
+The block below captures every multi-commit file's full diff to `$PATCH_DIR`
+*before* the `git checkout HEAD` discards those changes — run it as a whole, and
+never run the `git checkout` line in isolation. Keep `$PATCH_DIR` until the final
+sanity-check passes.
+
 ```bash
 # Pre-flight: save full diffs of every multi-commit file, then reset them to
 # HEAD so the working tree is clean. This captures staged AND unstaged hunks
@@ -264,11 +276,6 @@ hunk headers after each one. The reliable workflow:
 # boundary for these files — you're re-splitting them across 3+ groups anyway.
 PATCH_DIR=$(mktemp -d -t atomic-patches.XXXXXX)
 MULTI_COMMIT_FILES=(path/to/file-a path/to/file-b)
-The block below captures every multi-commit file's full diff to `$PATCH_DIR`
-*before* the `git checkout HEAD` discards those changes — run it as a whole, and
-never run the `git checkout` line in isolation. Keep `$PATCH_DIR` until the final
-sanity-check passes.
-
 for f in "${MULTI_COMMIT_FILES[@]}"; do
   # Diff against HEAD so staged AND unstaged hunks are captured; slug the path
   # so files that share a basename don't overwrite each other's patch.
@@ -394,11 +401,12 @@ act on it without you in the room.
   showed…" — when the audit is an ephemeral session activity, not a
   named feature/log/script in the repo
 - "previous session", "earlier in this thread", "as discussed earlier"
-- "Round 1 findings", "round 2 caught", "the review pass said",
+- "Round 1 findings", "round 2 caught", "codex round 2 verdict",
   "fresh-eyes pass"
-- "the outside review flagged", "the external reviewer said"
-- "the scratch notes said", "per the final-plan note",
-  "the design doc we wrote earlier"
+- "codex-peer-review flagged", "the codex pass said",
+  "outside review"
+- ".scratch/notes/X said", "per the final-plan note",
+  "the decision-tree document"
 
 **Not forbidden** when they describe something in the repo: `audit`
 in a commit about audit log code, `R1`/`R2` for release labels or a
@@ -493,6 +501,8 @@ Plan and guide interactive rebase of the current branch from a base commit.
 
 ### Safety
 
+- Offer to create a restore point (a backup branch or checkpoint) before
+  rebasing -- it rewrites history and is awkward to unwind without one
 - Always check for uncommitted changes before rebase. If present, ask the
   user before stashing -- `git stash` mutates state and may conflict with
   staged intent. Never stash silently
@@ -500,9 +510,47 @@ Plan and guide interactive rebase of the current branch from a base commit.
 - If rebase conflicts, resolve using the Conflict Resolution workflow below
 - Never rebase published commits without explicit user confirmation
 
+### Signed commits and interactive signers
+
+Rebase re-creates every replayed commit, so on a signed history signing is a
+preflight. Before any rebase -- this subcommand or the `audit` reword handoff --
+inspect the setup:
+
+```bash
+git config --type=bool --get commit.gpgsign 2>/dev/null || echo false   # true => picks + amends re-signed
+git config --get gpg.format         # ssh | openpgp | x509
+git config --get user.signingkey    # a `key::...@secretive...` value => Secretive
+git cat-file -p HEAD | grep -c '^gpgsig' || true   # >=1 => HEAD is signed (any format)
+```
+
+- **Do not read signed-ness off `%G?`.** `git log --format=%G?` reports `N`
+  (with "gpg.ssh.allowedSignersFile needs to be configured") when it cannot
+  *verify* an SSH signature -- a verification-config gap, not an unsigned commit.
+  Use the format-neutral `git cat-file -p <sha> | grep -c '^gpgsig'` instead,
+  across the whole replay range rather than just the tip.
+- **`commit.gpgsign=true` is the only setting that signs the reword;
+  `rebase.gpgSign` and `-S` do not.** git's interactive (merge-backend) rebase
+  re-signs every replayed pick -- and every `exec git commit --amend` -- when
+  `commit.gpgsign` is true (verified, git 2.54), so this is the setting the
+  `audit` reword depends on. The `rebase.gpgSign` *config* is silently ignored by
+  this backend (verified). A command-line `-S` re-signs the replayed picks but is
+  **not** inherited by the `exec git commit --amend` children (verified), so it
+  leaves the reworded commits *unsigned* -- do not reach for `-S` as a substitute
+  here. So if the replay range is signed but `commit.gpgsign` is not true, stop:
+  enable it, or get explicit user sign-off to produce unsigned commits, rather
+  than silently dropping signatures.
+- **An interactive signer cannot be driven from this non-interactive tool.**
+  When signing needs an agent approval -- Secretive, a hardware SSH key,
+  gpg-agent + pinentry, a YubiKey touch -- git blocks on the signature request
+  and the Bash tool hangs. Do **not** run the rebase in-tool. For an `audit`
+  reword, copy `references/reword-runner.sh` to the session scratchpad (the
+  approved `<short-sha>.txt` message files are already there from audit step 5.2),
+  fill its four FILL blocks (repo, message dir = that `reword/` dir, base, tip SHA
+  + violating short SHAs), and hand off `! bash <copy>`. Keep the files until the
+  rebase completes or aborts. Expect up to P+V signer approvals -- one per
+  replayed pick (P) plus one per amend (V); signature caching may prompt fewer.
+
 ---
-- Offer to create a restore point (a backup branch or checkpoint) before
-  rebasing -- it rewrites history and is awkward to unwind without one
 
 ## Subcommand: `cherry-pick`
 
@@ -607,9 +655,223 @@ Create fixup commits that target existing commits for later autosquash.
    ```
 6. Remind user to integrate later with one of:
    - `/atomic rebase` (agent-assisted)
-   - `git rebase -i --autosquash <target-sha>~1` (user runs directly). If the
+   - `! git rebase -i --autosquash <target-sha>~1` (user runs directly). If the
      target is the repo's root commit it has no `~1` — use
-     `git rebase -i --root --autosquash` instead
+     `! git rebase -i --root --autosquash` instead
+
+---
+
+## Subcommand: `audit` (alias `lint`)
+
+Scan existing commit messages for session-internal references -- the patterns
+forbidden by [Commit and PR Message Hygiene](#commit-and-pr-message-hygiene).
+The `commit` and `generate` workflows check messages at draft time; this
+subcommand covers history written outside them (plain `git commit -m`) and
+retroactive sweeps.
+
+### Usage
+
+```
+/atomic audit [range|base]    # e.g. main..HEAD, HEAD~20, v2.1.0
+/atomic lint  [range|base]    # alias, same behavior
+```
+
+**Range resolution** (no argument): audit local commits not yet on the
+upstream. Use the first ref that resolves:
+
+1. `@{upstream}..HEAD` -- check with `git rev-parse --verify -q '@{upstream}'`
+2. `origin/HEAD..HEAD` -- check with `git rev-parse --verify -q origin/HEAD`
+3. All of `HEAD` (no remote ref resolves) -- state this in the report
+
+An explicit argument containing `..` is used as the range verbatim; anything
+else is a base, audited as `<base>..HEAD`.
+
+`--dry-run`: report only (steps 1-4), never offer the reword handoff.
+
+### Workflow
+
+#### 1. Collect candidates
+
+Count first: `git rev-list --count <range>`. For modest ranges (up to ~40
+commits), skip the grep and read every message directly:
+
+```bash
+git log --format='%h%n%B%x1e' <range>
+```
+
+For larger ranges, pre-filter with git's message grep (matches subject AND
+body), then read each hit in full:
+
+```bash
+git log -i -E --format='%h %s' \
+  --grep='stress[- ]test|peer[- ]review|done[- ]gate|external[- ]review|outside[- ]review|fresh[- ]eyes|adversarial|codex|claude|\.scratch|round [0-9]|r[0-9]+ (caught|review|round|verdict)|reviews? (round|caught|flagged|surfaced|produced|said)|(prior|previous|earlier) (session|thread|review|pass)|earlier in (this|the)|as discussed|audit(ed|ing)|audit (run|confirmed|showed)|the audit|plan doc|plans?/|final-plan|decision-tree' \
+  <range>
+```
+
+The pattern is a wide net seeded from the hygiene section's forbidden list --
+it over-catches on purpose, and classification (step 2) sorts the hits. It is
+not exhaustive: also skim the remaining subjects (`git log --format='%h %s'
+<range>`) for anything session-flavored the net missed, and read the full
+message of every netted commit (`git show -s --format=%B <sha>`) -- the match
+may sit in the body, not the subject. The net is prioritization, never
+exclusion: a session reference that sits only in the body of a commit the
+net missed is invisible to it. When the range is small enough to read in
+batches, read every message; otherwise mark the report's Coverage line as
+partial rather than implying full coverage.
+
+#### 2. Classify each hit
+
+A matched term is not automatically a violation. Per phrase:
+
+| Verdict         | Criterion                                                      |
+|-----------------|----------------------------------------------------------------|
+| VIOLATION       | Names the review, session, or process that produced the change |
+| FINE            | Names a real artifact in the repo or the commit's own diff     |
+| REVIEW MANUALLY | Unsure which -- surface it, never auto-dismiss                 |
+
+To call a hit FINE, artifact existence is necessary but not sufficient: the
+phrase must actually refer to that artifact, not to a same-named session
+activity. Confirm existence against the commit's own diff
+(`git show --stat <sha>`) or its tree (`git ls-tree <sha> -- <path>`,
+`git grep <term> <sha>`), not the current checkout -- the artifact may
+postdate the commit. Examples: a test literally named "stress test", an
+"adversarial fixture" that is checked in, a Cloudflare R2 bucket, a date
+that appears in a migration filename in the diff. "The stress-test surfaced
+a race" with no such artifact is a VIOLATION; when the phrase could read
+either way, that is REVIEW MANUALLY, not FINE. Err toward surfacing: when
+the check is inconclusive, report REVIEW MANUALLY.
+
+#### 3. Report
+
+One row per offending phrase -- a commit with several phrases gets several
+rows, each with its own verdict:
+
+```
+Message-hygiene audit of <range>: N commits scanned, M violations, K to review manually
+Coverage: <full -- every message read | partial -- subjects + netted bodies only>
+
+| SHA     | Offending phrase                | Verdict         | Suggested rewrite                      |
+|---------|---------------------------------|-----------------|----------------------------------------|
+| abc1234 | "R4 review round caught a race" | VIOLATION       | "cache writes raced under concurrency" |
+| def5678 | "prior session tokens leaked"   | REVIEW MANUALLY | (pending -- domain term or session?)   |
+```
+
+Suggested rewrites state the defect or behavior directly instead of how it
+was found ("X is unused", "this fixes Y bug", "Z was racy under concurrent
+writes") -- the same rule the hygiene section applies at draft time.
+
+#### 4. Published-commit check
+
+The **push target** is `@{push}` when it resolves
+(`git rev-parse --verify -q '@{push}'` -- triangular setups push elsewhere
+than they pull), else `@{upstream}`. Run both tests for every violating
+commit -- the push target alone misses commits pushed to other branches:
+
+```bash
+git merge-base --is-ancestor <sha> <push-target>   # exit 0 = on the branch's push target
+git branch -r --contains <sha>                     # output names fetched remote branches holding it
+```
+
+The two hits mean different things -- warn explicitly and require
+acknowledgment before including a hit commit in the handoff:
+
+- Hit on the push target: the ref this branch pushes to holds the commit --
+  rewording it means the eventual push needs `--force-with-lease`.
+- Hit on any other fetched remote ref (`--contains` output): that branch
+  keeps the old commit and will diverge from the rewrite. No force-push of
+  this branch is implied; the user decides whether rewording still makes
+  sense.
+
+With no push target, only the `--contains` check runs. The default range
+usually excludes push-target commits by construction; a merge-base hit
+still happens in triangular setups or when an explicit range or base
+reached behind the push target. Unfetched remote state is unknowable
+either way.
+
+#### 5. Reword handoff (on approval only)
+
+Propose-only: never rewrite without explicit approval, and never under
+`--dry-run`. The `rebase` subcommand's Safety rules apply (clean tree,
+restore-point offer, no silent stash).
+
+**Sequencing:** first resolve every REVIEW MANUALLY row with the user to
+VIOLATION or FINE -- the resolved violation set drives everything below,
+and the handoff amends only resolved VIOLATIONs. Then (re-)run step 4 and
+the preconditions over that final set: a row resolved late may be published
+or outside HEAD's history, and until the set is final
+`<oldest-violating-sha>` is undefined. If the final resolved violation set
+is empty, report clean and stop; there is nothing to hand off.
+
+**Handoff preconditions** -- verify all before proposing; if any fails,
+deliver the report only and say why the handoff is unavailable:
+
+- The audited range ends at `HEAD` (the default and `<base>..HEAD` forms
+  always do). For an explicit `A..B` where `B` is not `HEAD`, suggest
+  re-running as `A..HEAD` -- after a rebase, a literal-SHA endpoint keeps
+  naming pre-rebase history, so neither verification nor audited
+  membership can be derived from it.
+- Every violating commit is an ancestor of HEAD
+  (`git merge-base --is-ancestor <sha> HEAD`). An explicit range on another
+  branch, or a three-dot range, can select commits a rebase of the current
+  branch can never rewrite -- the same reason the `rebase` subcommand
+  rejects ranges as its base.
+- No merge commits among the commits to replay:
+  `git rev-list --merges <oldest-violating-sha>^..HEAD` prints nothing
+  (use `git rev-list --merges HEAD` when the oldest violating commit is
+  the repo's root commit -- it has no `^`). A flat `pick` todo cannot
+  replay a merge without a mainline (see the `cherry-pick` merge rule);
+  if any exist, leave the rewording to the user.
+
+On approval:
+
+1. Draft the exact replacement message (subject + body) for every VIOLATION
+   and present them in full. Approval covers these literal texts, not the
+   report's one-line rewrites.
+2. Write each approved message with the **Write tool** to
+   `<scratchpad>/reword/<short-sha>.txt` -- one file per commit, named by the
+   commit's short SHA (the reword runner reads exactly these paths). Use the
+   durable session scratchpad, not a `mktemp` dir the OS may reap, since the
+   signer handoff may run later. Generate each message from the commit
+   (`git show -s --format=%B <sha>`, then edit) rather than retyping it --
+   retyping risks mangling non-ASCII bytes (em dashes, etc.).
+3. Build the rebase todo as in `rebase` step 5 (Write tool to
+   `<git-dir>/rebase-todo-plan`): every commit of
+   `<oldest-violating-sha>^..HEAD` in order as `pick`, with an `exec` line
+   after each violating pick:
+
+   ```
+   pick abc1234 old subject
+   exec git commit --amend -F <scratchpad>/reword/abc1234.txt
+   pick def5678 unaffected commit
+   ```
+
+   `git commit --amend -F` opens no editor, so the `GIT_SEQUENCE_EDITOR`
+   injection is the only override needed. If the oldest violating commit is
+   the repo's root commit, rebase with `--root` instead of `<sha>^`. This todo
+   is used only by the in-tool path (step 5.4's "otherwise"); the signer runner
+   rebuilds its own, so skip this write when you already know you're handing off.
+4. First run the signing preflight in the `rebase` subcommand's **Signed commits
+   and interactive signers** section. If the history is signed with an
+   interactive signer, do not rebase in-tool -- hand off the runner and continue
+   to step 5 once the user reports the rebase completed (verify first; the push,
+   if any, comes after step 5). Otherwise execute as `rebase` step 5, adding
+   `--reschedule-failed-exec` to the `git rebase -i` call -- without it a failed
+   `exec git commit --amend` (hook, signer denial) is skipped on
+   `git rebase --continue`, silently leaving that commit un-reworded. Keep the
+   message files until the rebase finishes: a conflict pause leaves the remaining
+   `exec` lines still reading them, so name the directory in the recovery message
+   and delete it only after `git rebase --continue` completes (or `--abort`).
+5. Verify against the rebase base, not the audited range. Non-root:
+   capture `<oldest-violating-sha>^` as a literal SHA before rebasing (it
+   is the rebase base and keeps its SHA) and re-scan `<that-sha>..HEAD`.
+   Root (`--root` rebase): there is no base -- re-scan all of `HEAD`. Run
+   the re-scan at the same or better coverage than step 1. Success means
+   every previously identified violation is gone from the reworded
+   commits; any additional hit (possible at better coverage, since every
+   replayed commit was inside the audited range) is a new finding to
+   report, not a verification failure. Every SHA from the first reworded
+   commit onward has changed; if the push target held any reworded commit,
+   the push needs `--force-with-lease`.
 
 ---
 
@@ -658,6 +920,6 @@ semantic conflicts.
   lowercase, no trailing period, subject under 72 chars) live in the
   `generate` subcommand's Rules and Conventional Commit Types table
 - Commit messages and PR descriptions must not reference
-  session-internal artifacts (audits, scratch notes, plans, review
+  session-internal artifacts (audits, `.scratch/` notes, plans, review
   rounds, prior sessions). See **Commit and PR Message Hygiene** for
   examples, heuristic, and rationale.

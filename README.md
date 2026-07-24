@@ -6,9 +6,10 @@ a self-contained `SKILL.md` in its own directory.
 ## Skills
 
 - **[`atomic`](./atomic)** — Split working-tree changes into logical atomic
-  commits, generate conventional commit messages, plan interactive rebases, and
-  cherry-pick safely. Subcommands: `commit` (default), `generate`, `rebase`,
-  `cherry-pick`, `fixup`; all support `--dry-run`.
+  commits, generate conventional commit messages, plan interactive rebases,
+  cherry-pick safely, and audit commit history for session-internal references.
+  Subcommands: `commit` (default), `generate`, `rebase`, `cherry-pick`,
+  `fixup`, `audit` (alias `lint`); all support `--dry-run`.
 
 ## Install
 
